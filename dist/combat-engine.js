@@ -1555,5 +1555,43 @@
     renderAllPanels();
   };
 
-  console.log('[多维矩阵·战斗引擎] v6 已加载（通用骰子+技能/装备卡片+多动作回合+伤害类型+消耗品+敌人生成）');
+  /* ===== 同层前端适配: enterCombat + CombatV6 命名空间 (增量, 不改既有逻辑) ===== */
+  async function enterCombat(spawns, opts){
+    opts=opts||{};
+    var d=fetchStatData();
+    var state={turn:1,units:[],log:[],phase:'PLAYER_ACTING',active:true,targetIdx:1,combatMessageId:null,pendingActions:[]};
+    if(d){ var p=seedPlayer(d); calcDerived(p); state.units.push(p); }
+    else{ var p2=makeEnemy('玩家',40,12,12,12,12,12,12); p2.isPlayer=true; p2.id='player'; calcDerived(p2); state.units.push(p2); }
+    var arr=Array.isArray(spawns)?spawns:[];
+    arr.forEach(function(s){
+      var en=makeEnemy(s.name||'敌人', s.hp||30, s.str||12, s.agi||14, s.con||10, 8,8,8);
+      calcDerived(en); state.units.push(en);
+    });
+    addLog(state,'-- 战斗开始 · 回合1 --');
+    saveCombatState(state);
+    var initReport=buildReport(state,'战斗开始！'+state.units.map(function(u){return u.name+' HP'+u.hp+'/'+u.derived.hpMax;}).join(' vs '),'','战斗开始');
+    var msgContent = opts.injectCombatHud ? ('<CombatHud/>\n\n'+initReport) : initReport;
+    try{ if(typeof createChatMessages==='function'){ await createChatMessages([{role:'assistant',message:msgContent}],{refresh:'affected'}); } }catch(e){ console.error('[战斗引擎v6] enterCombat创建战斗消息层失败',e); }
+    try{ if(typeof getLastMessageId==='function'){ state.combatMessageId=getLastMessageId(); } }catch(e){}
+    saveCombatState(state);
+    return state;
+  }
+  HOST.enterCombat=enterCombat;
+  HOST.CombatV6={
+    nebDice:nebDice, evalDiceStr:evalDiceStr, lookupDB:lookupDB,
+    resolveAttack:resolveAttack, calcDerived:calcDerived, buildBuffedContext:buildBuffedContext,
+    seedPlayer:seedPlayer, makeEnemy:makeEnemy, fetchStatData:fetchStatData,
+    readSkillCards:readSkillCards, readEquipmentCards:readEquipmentCards, readConsumableCards:readConsumableCards, getEquippedSlots:getEquippedSlots,
+    doPlayerAttack:doPlayerAttack, doSkill:doSkill, doDodge:doDodge, doParry:doParry, doMove:doMove, doFreeRoll:doFreeRoll, doCustomAction:doCustomAction, doUseConsumable:doUseConsumable, doCounter:doCounter, doDualWield:doDualWield, doThrow:doThrow,
+    addBuff:addBuff, removeBuff:removeBuff, adjustHP:adjustHP,
+    endTurn:endTurn, tick:tick, addActionToQueue:addActionToQueue,
+    buildReport:buildReport, buildBattleSnapshot:buildBattleSnapshot, appendCombatToLayer:appendCombatToLayer,
+    callAI:callAI, cleanAIReply:cleanAIReply, processAIReply:processAIReply, resolveEnemyAction:resolveEnemyAction, parseEnemyAction:parseEnemyAction, parseEnemySpawn:parseEnemySpawn, checkEnemySpawn:checkEnemySpawn,
+    getCombatState:getCombatState, saveCombatState:saveCombatState, clearCombatState:clearCombatState,
+    distance:distance, inRange:inRange, unitsInAOE:unitsInAOE, ATTRS:ATTRS, ROLL_TARGETS:ROLL_TARGETS,
+    startCombatSession:startCombatSession, enterCombat:enterCombat, combatAction:HOST.combatAction,
+    renderCombatPanel:renderCombatPanel
+  };
+
+  console.log('[多维矩阵·战斗引擎] v6 已加载（通用骰子+技能/装备卡片+多动作回合+伤害类型+消耗品+敌人生成 + 同层前端适配）');
 })();
