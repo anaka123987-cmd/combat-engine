@@ -794,7 +794,7 @@
 
   /* ===== 战斗结束：将战斗消息体替换为摘要（移除<CombatHud/>，回归非同层对话） ===== */
   async function finalizeCombatMessage(state, endMsg){
-    if(!state||state.combatMessageId==null)return;
+    if(!state)return;
     var digests=state.digests||[];
     var summary='═══ 战斗记录 · '+endMsg+' ═══\n\n';
     if(digests.length){
@@ -805,11 +805,12 @@
       logs.slice(-10).forEach(function(e){ summary+=e.text+'\n'; });
     }
     summary+='\n（战斗结束，继续剧情对话）';
+    /* 不再写回注入楼层：发送摘要战报到新楼层 */
     try{
-      if(typeof setChatMessages==='function'){
-        await setChatMessages([{message_id:state.combatMessageId, message:summary}], {refresh:'affected'});
+      if(typeof createChatMessages==='function'){
+        await createChatMessages([{role:'assistant',message:summary}],{refresh:'affected'});
       }
-    }catch(e){ console.error('[战斗引擎v6] 战斗摘要写入失败',e); }
+    }catch(e){ console.error('[战斗引擎v6] 战斗摘要发送失败',e); }
     /* 延迟清除状态（让renderAllPanels先渲染结束态） */
     setTimeout(function(){ clearCombatState(); renderAllPanels(); }, 1500);
   }
@@ -1009,9 +1010,7 @@
     saveCombatState(state);
     var initReport=buildReport(state,'战斗开始！'+state.units.map(function(u){return u.name+' HP'+u.hp+'/'+u.derived.hpMax;}).join(' vs '),'','战斗开始');
     addLog(state,initReport);
-    var msgContent='<CombatHud/>';
-    try{ if(typeof createChatMessages==='function'){ await createChatMessages([{role:'assistant',message:msgContent}],{refresh:'affected'}); } }catch(e){ console.error('[战斗引擎v6] 创建战斗消息层失败',e); }
-    try{ if(typeof getLastMessageId==='function'){ state.combatMessageId=getLastMessageId(); } }catch(e){}
+    /* 不注入新楼层：战斗面板由复合控制台挂载到当前楼层 */
     saveCombatState(state);
   }
 
@@ -2033,8 +2032,8 @@
       addLog(state,'-- 战斗开始 · 回合1 --');
       var initReport=buildReport(state,'战斗开始！'+state.units.map(function(u){return u.name+' HP'+u.hp+'/'+u.derived.hpMax;}).join(' vs '),'','战斗开始');
       addLog(state,initReport);
-      var msgContent='<CombatHud/>'; saveCombatState(state);
-      try{ if(typeof createChatMessages==='function'){ createChatMessages([{role:'assistant',message:msgContent}],{refresh:'affected'}).then(function(){ try{ if(typeof getLastMessageId==='function'){ state.combatMessageId=getLastMessageId(); saveCombatState(state); } }catch(e){} }); } }catch(e){ console.error('[战斗引擎v6] 创建战斗消息层失败',e); }
+      /* 不注入新楼层 */
+      saveCombatState(state);
       renderAllPanels(); return;
     }
     if(act==='endcombat'){ addLog(state,'-- 战斗结束（手动） --'); finalizeCombatMessage(state,'战斗结束（手动）'); return; }
@@ -2515,9 +2514,7 @@
     addLog(state,initReport);
     saveCombatState(state);
     /* 消息体只放 <CombatHud/>，战报进state.log，控制台从state渲染 */
-    var msgContent = opts.injectCombatHud ? '<CombatHud/>' : (opts.initReport||'');
-    try{ if(typeof createChatMessages==='function'){ await createChatMessages([{role:'assistant',message:msgContent}],{refresh:'affected'}); } }catch(e){ console.error('[战斗引擎v6] enterCombat创建战斗消息层失败',e); }
-    try{ if(typeof getLastMessageId==='function'){ state.combatMessageId=getLastMessageId(); } }catch(e){}
+    /* 不注入新楼层：战斗面板由复合控制台挂载到当前楼层 */
     saveCombatState(state);
     return state;
   }
