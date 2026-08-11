@@ -743,7 +743,7 @@
     var olderDis=dis.length>5?dis.slice(0,dis.length-5):[];
     var history='';
     if(recentNas.length){ history+='\n\n【历回合战报(全文)】\n'+recentNas.map(function(n){return '—— 回合'+n.turn+' ——\n'+n.text;}).join('\n\n'); }
-    if(olderDis.length){ history+='\n\n【更早战报摘要】\n'+olderDis.map(function(d){return '回合'+d.turn+'·'+d.title+': '+d.text;}).join('\n'); }
+    if(olderDis.length){ history+='\n\n【更早战报摘要】\n'+olderDis.map(function(d){return '回合'+d.turn+': '+d.text;}).join('\n'); }
     /* 自适应prompt：_pendingAIUnits 存放需要AI决策的单位名 */
     var needAIList=state._pendingAIUnits||[];
     var promptTail;
@@ -962,7 +962,7 @@
     }
     /* digest 摘要 → 战报存档 */
     var digest=parseDigest(reply);
-    if(digest){ if(!state.digests)state.digests=[]; state.digests.push({turn:state.turn,title:digest.title||('回合'+state.turn),text:digest.text}); }
+    if(digest){ if(!state.digests)state.digests=[]; state.digests.push({turn:state.turn,title:digest.title,text:digest.text}); }
     /* 叙述正文 → 正文tab当回合 + narratives累积 */
     var cleanText=cleanAIReply(reply);
     if(cleanText){ state._narrativeText=cleanText; if(!state.narratives)state.narratives=[]; state.narratives.push({turn:state.turn,text:cleanText}); }
@@ -2186,7 +2186,7 @@
   function parseDigest(text){
     var m=String(text||'').match(/<summary[^>]*>([\s\S]*?)<\/summary>/i);
     if(!m)return null;
-    return {title:'', text:m[1].trim()};
+    return {title:null, text:m[1].trim()};
   }
 
   /* ======================================================================
