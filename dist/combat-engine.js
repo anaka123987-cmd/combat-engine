@@ -748,9 +748,9 @@
     var needAIList=state._pendingAIUnits||[];
     var promptTail;
     if(needAIList.length){
-      promptTail='\n\n请演绎战斗(<content>...</content>)，</content>后生成digest(<details>...</details>)。\n以下单位无前端逻辑，请为其输出行动标签：'+needAIList.join('、')+'。\n格式：<enemy_action>行动者|行动类型|目标|参数</enemy_action> 或 <ally_action>队友名|行动类型|目标|参数</ally_action>。\n不要自行计算数值（命中/伤害/DB/闪避/格挡/AOE全由前端结算）。';
+      promptTail='\n\n请演绎战斗(<content>...</content>)，</content>后生成摘要(<summary>...</summary>)。\n以下单位无前端逻辑，请为其输出行动标签：'+needAIList.join('、')+'。\n格式：<enemy_action>行动者|行动类型|目标|参数</enemy_action> 或 <ally_action>队友名|行动类型|目标|参数</ally_action>。\n不要自行计算数值（命中/伤害/DB/闪避/格挡/AOE全由前端结算）。';
     } else {
-      promptTail='\n\n请演绎战斗(<content>...</content>)，</content>后生成digest(<details>...</details>)。\n所有单位均由前端决策，无需输出<enemy_action>/<ally_action>。\n不要自行计算数值（命中/伤害/DB/闪避/格挡/AOE全由前端结算）。';
+      promptTail='\n\n请演绎战斗(<content>...</content>)，</content>后生成摘要(<summary>...</summary>)。\n所有单位均由前端决策，无需输出<enemy_action>/<ally_action>。\n不要自行计算数值（命中/伤害/DB/闪避/格挡/AOE全由前端结算）。';
     }
     var userInput=report+history+promptTail;
     if(typeof generate!=='function')throw new Error('generate函数不可用，请确保酒馆助手已安装');
@@ -765,7 +765,7 @@
     var cm=t.match(/<content>([\s\S]*?)<\/content>/i);
     if(cm){ t=cm[1]; }
     /* 剥除所有结构化标签（闭合+未闭合到结尾） */
-    var stripTags=['enemy_spawn','enemy_action','enemy_skills','enemy_equipment','enemy_logic','enemy_script','ally_spawn','ally_action','ally_skills','ally_equipment','ally_logic','ally_script','skill_register','terrain','details','update','updatevariable','content'];
+    var stripTags=['enemy_spawn','enemy_action','enemy_skills','enemy_equipment','enemy_logic','enemy_script','ally_spawn','ally_action','ally_skills','ally_equipment','ally_logic','ally_script','skill_register','terrain','summary','update','updatevariable','content'];
     stripTags.forEach(function(tag){
       t=t.replace(new RegExp('<'+tag+'>[\\s\\S]*?</'+tag+'>','gi'),'');
       t=t.replace(new RegExp('<'+tag+'[^>]*>[\\s\\S]*$','gi'),'');
@@ -805,6 +805,7 @@
       logs.slice(-10).forEach(function(e){ summary+=e.text+'\n'; });
     }
     summary+='\n（战斗结束，继续剧情对话）';
+    summary='<summary>'+summary+'</summary>';
     /* 不再写回注入楼层：发送摘要战报到新楼层 */
     try{
       if(typeof createChatMessages==='function'){
@@ -2183,13 +2184,9 @@
    * Digest 解析 — A1
    * ====================================================================== */
   function parseDigest(text){
-    var m=String(text||'').match(/<details[^>]*>([\s\S]*?)<\/details>/i);
+    var m=String(text||'').match(/<summary[^>]*>([\s\S]*?)<\/summary>/i);
     if(!m)return null;
-    var inner=m[1];
-    var titleMatch=inner.match(/<summary[^>]*>([\s\S]*?)<\/summary>/i);
-    var title=titleMatch?titleMatch[1].trim():'';
-    var body=inner.replace(/<summary[^>]*>[\s\S]*?<\/summary>/i,'').trim();
-    return {title:title, text:body};
+    return {title:'', text:m[1].trim()};
   }
 
   /* ======================================================================
