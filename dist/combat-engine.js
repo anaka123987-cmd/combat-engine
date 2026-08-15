@@ -436,11 +436,19 @@
     return false;
   }
 
+  /* ===== 最新楼层ID（避免使用运行时不会被替换的 {{lastMessageId}} 宏） ===== */
+  function lastMsgIdSafe(){
+    try{ if(typeof getLastMessageId==='function'){ var n=Number(getLastMessageId()); if(!isNaN(n))return n; } }catch(e){}
+    try{ if(typeof getCurrentMessageId==='function'){ var n2=Number(getCurrentMessageId()); if(!isNaN(n2))return n2; } }catch(e2){}
+    return null;
+  }
+
   /* ===== MVU stat_data读取 ===== */
   function fetchStatData(){
     try{
       if(typeof getChatMessages==='function'){
-        var msgs=getChatMessages('0-{{lastMessageId}}');
+        var lid=lastMsgIdSafe();
+        var msgs=lid!=null?getChatMessages('0-'+lid):null;
         if(msgs&&msgs.length){
           for(var i=msgs.length-1;i>=0;i--){ var m=msgs[i]; var d=(m&&m.data&&m.data.stat_data)||(m&&m.stat_data); if(d)return d; }
         }
@@ -690,6 +698,172 @@
   function addLog(state,text,cls){ if(!state.log)state.log=[]; state.log.push({turn:state.turn,text:text,cls:cls||''}); if(state.log.length>60)state.log.shift(); }
   function costAP(unit,ap){ unit.ap-=ap; unit.hp-=ap*5; if(unit.hp<0)unit.hp=0; }
 
+  /* ======================================================================
+   * <pos> 站位系统 + 持械攻击模式 + 队列回滚（新增）
+   * ====================================================================== */
+  /* 解析 <pos>块：一行一个 名称|(x,y)，兼容全角（），｜，，；取最后一个块，同名后行覆盖前行 */
+  function parsePositions(text){
+    if(!text)return null;
+    var blocks=String(text).match(/<pos>([\s\S]*?)<\/pos>/gi);
+    if(!blocks||!blocks.length)return null;
+    var raw=blocks[blocks.length-1].replace(/<\/?pos>/gi,'');
+    var map={}, order=[];
+    raw.split(/\r?\n/).forEach(function(line){
+      var mm=line.trim().match(/^([^|()（）]+?)\s*[|｜]\s*[（(]\s*(\d+)\s*[,，]\s*(\d+)\s*[)）]\s*$/);
+      if(mm){ var k=mm[1].trim(); map[k]={x:parseInt(mm[2],10),y:parseInt(mm[3],10)}; order.push(k); }
+    });
+    return order.length?{map:map,order:order}:null;
+  }
+  /* 玩家别名：主页.代号 / 主页.姓名 / "玩家" / 单位名，均可指代玩家 */
+  function playerAliases(data,pUnit){
+    var alias={'玩家':1};
+    try{
+      var code=String(getValue(data,'主页.代号','')||'').trim();
+      var nm=String(getValue(data,'主页.姓名','')||'').trim();
+      if(code)alias[code]=1; if(nm)alias[nm]=1;
+    }catch(e){}
+    if(pUnit&&pUnit.name){ var un=String(pUnit.name).trim(); if(un)alias[un]=1; }
+    return alias;
+  }
+  /* 应用 <pos> 到战斗单位：按名匹配（玩家走别名），同名多个按出现顺序依次对应；
+     墙壁/越界坐标忽略并写战报 */
+  function applyPositions(state,text){
+    try{
+      if(!state||!state.units)return false;
+      var pp=parsePositions(text); if(!pp)return false;
+      var data=fetchStatData();
+      var pUnit=getControlledUnit(state);
+      var alias=playerAliases(data,pUnit);
+      var cursor={};
+      var applied=0;
+      pp.order.forEach(function(k){
+        var pos=pp.map[k]; if(!pos)return;
+        var isPlayerKey=!!alias[k];
+        var cands=[];
+        state.units.forEach(function(u){
+          if(u.hp<=0)return;
+          if(isPlayerKey){ if(u.isPlayer)cands.push(u); }
+          else { if(!u.isPlayer&&String(u.name||'').trim()===k)cands.push(u); }
+        });
+        var idx=cursor[k]||0; cursor[k]=idx+1;
+        var u=cands[idx]; if(!u)return;
+        if(state.terrain){
+          if(pos.x<0||pos.y<0||pos.x>=state.terrain.width||pos.y>=state.terrain.height){ addLog(state,'[站位] '+u.name+' 坐标('+pos.x+','+pos.y+')越界，已忽略'); return; }
+          var cell=terrainAt(state,pos.x,pos.y);
+          if(cell&&cell.blocking){ addLog(state,'[站位] '+u.name+' 坐标('+pos.x+','+pos.y+')是墙壁，已忽略'); return; }
+        }
+        u.x=pos.x; u.y=pos.y; applied++;
+      });
+      if(applied){ addLog(state,'[站位] 已按<pos>更新 '+applied+' 个单位坐标'); return true; }
+    }catch(e){ console.warn('[战斗引擎v6] pos应用失败',e); }
+    return false;
+  }
+  /* 输出当前全部存活单位站位为 <pos> 块（玩家用 代号‖姓名‖"玩家"） */
+  function buildPositionsBlock(state){
+    var data=fetchStatData();
+    var code='',nm='';
+    try{ code=String(getValue(data,'主页.代号','')||'').trim(); nm=String(getValue(data,'主页.姓名','')||'').trim(); }catch(e){}
+    var lines=[];
+    (state.units||[]).forEach(function(u){
+      if(u.hp<=0)return;
+      var n=u.isPlayer?(code||nm||'玩家'):String(u.name||'未知');
+      lines.push(n+'|('+num(u.x,0)+','+num(u.y,0)+')');
+    });
+    return '<pos>\n'+lines.join('\n')+'\n</pos>';
+  }
+  /* 持械攻击模式：单手2AP / 双持(副手为武器)4AP / 双手武器3AP(力量不达标+1)
+     返回 {mode:'single'|'dual'|'twohand', apCost, label} */
+  function getAttackMode(unit,data){
+    var u=unit||{};
+    var wt=u.weaponType||'onehand';
+    var cards={};
+    try{ cards=data?readEquipmentCards(data):{}; }catch(e){}
+    var offName=u.equippedSlots?u.equippedSlots['副手']:null;
+    var offCard=offName?cards[offName]:null;
+    var isDual=!!(offCard&&(String(offCard.槽位||'')==='武器'||String(offCard.伤害||'').trim()!==''));
+    var str=num(u.eff&&u.eff['力量']?u.eff['力量']:u.attrs?u.attrs['力量']:10,10);
+    if(isDual)return {mode:'dual',apCost:4,label:'双持'};
+    if(wt==='twohand'){
+      var apCost=3;
+      var wreq=12;
+      try{
+        var wm=(offName===null&&u.equippedSlots&&u.equippedSlots['武器'])?cards[u.equippedSlots['武器']]:null;
+        if(wm&&wm.装备要求){ var rm=String(wm.装备要求).match(/力量\s*(\d+)/); if(rm)wreq=parseInt(rm[1],10); }
+      }catch(e2){}
+      if(str<wreq)apCost+=1;
+      return {mode:'twohand',apCost:apCost,label:'双手'};
+    }
+    return {mode:'single',apCost:2,label:'单手'};
+  }
+  /* AOE半径：优先武器"范围"字段中的数字(1-5)，无武器默认2 */
+  function weaponAOERadius(weapon){
+    if(weapon){
+      var r=String(weapon.范围!=null?weapon.范围:'');
+      var m=r.match(/(\d+(?:\.\d+)?)/);
+      if(m)return clamp(Math.round(parseFloat(m[1])),1,5);
+      if(/溅射|范围|爆炸|全体|aoe/i.test(r))return 2;
+    }
+    return 2;
+  }
+  /* 队列回滚：按undo载荷恢复AP/耐力/目标HP/坐标/新增buff */
+  function undoPendingAction(state,pa){
+    try{
+      if(!state||!pa||!pa.undo)return;
+      var u=pa.undo;
+      var p=getControlledUnit(state);
+      if(p){
+        if(u.apCost){ p.ap=num(p.ap,0)+num(u.apCost,0); var apMax=p.derived?p.derived.apMax:4; if(p.ap>apMax)p.ap=apMax; }
+        if(u.staminaHp){ p.hp=num(p.hp,0)+num(u.staminaHp,0); calcDerived(p); var hpMax=p.derived?p.derived.hpMax:p.hp; if(p.hp>hpMax)p.hp=hpMax; }
+        if(u.dx!=null){ p.x=num(p.x,0)-num(u.dx,0); if(p.x<0)p.x=0; }
+        if(u.dy!=null){ p.y=num(p.y,0)-num(u.dy,0); if(p.y<0)p.y=0; }
+      }
+      (u.restores||[]).forEach(function(r){
+        var t=state.units[r.idx]; if(!t)return;
+        if(r.hp){ t.hp=num(t.hp,0)+num(r.hp,0); calcDerived(t); var hm=t.derived?t.derived.hpMax:t.hp; if(t.hp>hm)t.hp=hm; }
+        if(r.buffCut>0&&t.buffs&&t.buffs.length>=r.buffCut){ t.buffs.splice(t.buffs.length-r.buffCut,r.buffCut); }
+      });
+    }catch(e){ console.warn('[战斗引擎v6] 行动回滚失败',e); }
+  }
+  /* 删除队列项后按剩余队列重算 标记(闪避/格挡/反击/移动) */
+  function requeueMarks(state){
+    try{
+      var p=getControlledUnit(state); if(!p)return;
+      var q=state.pendingActions||[];
+      var has=function(t){ return q.some(function(a){return a&&a.type===t;}); };
+      p._isDodging=has('dodge');
+      p._isCountering=has('counter');
+      p._isMoving=has('move');
+      if(!has('parry'))p._parryState=null;
+    }catch(e){}
+  }
+  /* 自定义行动 · 投骰类型选择悬浮窗（替代原生prompt） */
+  function openRollTypeModal(state,rpText){
+    var overlay=HOST.document.createElement('div');
+    overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99999;display:flex;align-items:center;justify-content:center;';
+    overlay.innerHTML='<div style="background:#f3eefc;border:1px solid rgba(167,139,250,0.5);border-radius:14px;padding:18px;max-width:360px;width:90%;box-shadow:0 8px 32px rgba(140,120,200,0.18);font-family:inherit;color:#463f63;"><div style="font-weight:700;margin-bottom:10px;font-size:14px;">自定义行动 · 选择投骰类型</div><div style="margin-bottom:8px;"><label style="font-size:10px;color:#6b6488;">RP描述</label><div style="background:rgba(255,255,255,0.6);border-radius:6px;padding:5px 10px;font-size:12px;max-height:80px;overflow:auto;">'+esc(rpText)+'</div></div><div style="margin-bottom:8px;"><label style="font-size:10px;color:#6b6488;">投骰类型（不投骰=纯RP）</label><select id="cb-rt-type" style="width:100%;background:rgba(255,255,255,0.6);border:1px solid rgba(255,255,255,0.7);border-radius:6px;padding:5px 10px;font-size:12px;"><option value="">不投骰（纯RP）</option><option value="r力量">r力量</option><option value="rd敏捷">rd敏捷</option><option value="r智力">r智力</option><option value="r体质">r体质</option><option value="r精神">r精神</option><option value="r魅力">r魅力</option><option value="d20">d20</option><option value="d100">d100</option><option value="3d6">3d6</option></select></div><div style="display:flex;gap:6px;margin-top:12px;"><button id="cb-rt-ok" style="flex:1;background:rgba(167,139,250,0.2);border:1px solid rgba(167,139,250,0.4);border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer;color:#a78bfa;font-weight:600;">确认</button><button id="cb-rt-cancel" style="background:rgba(255,255,255,0.5);border:1px solid rgba(255,255,255,0.7);border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer;color:#463f63;">取消</button></div></div>';
+    HOST.document.body.appendChild(overlay);
+    overlay.querySelector('#cb-rt-cancel').onclick=function(){ overlay.remove(); };
+    overlay.querySelector('#cb-rt-ok').onclick=function(){ var rt=overlay.querySelector('#cb-rt-type').value; overlay.remove(); doCustomAction(state,rpText,rt); renderAllPanels(); };
+  }
+  /* 添加敌人 · 表单悬浮窗（替代连环prompt） */
+  function openAddEnemyModal(state){
+    var overlay=HOST.document.createElement('div');
+    overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:99999;display:flex;align-items:center;justify-content:center;';
+    var input=function(label,id,val){ return '<div style="margin-bottom:8px;"><label style="font-size:10px;color:#6b6488;">'+label+'</label><input id="'+id+'" value="'+val+'" style="width:100%;background:rgba(255,255,255,0.6);border:1px solid rgba(255,255,255,0.7);border-radius:6px;padding:5px 10px;font-size:12px;color:#463f63;"></div>'; };
+    overlay.innerHTML='<div style="background:#f3eefc;border:1px solid rgba(167,139,250,0.5);border-radius:14px;padding:18px;max-width:340px;width:90%;box-shadow:0 8px 32px rgba(140,120,200,0.18);font-family:inherit;color:#463f63;"><div style="font-weight:700;margin-bottom:10px;font-size:14px;">添加敌人</div>'+input('名称','cb-ae-name','哥布林')+input('HP','cb-ae-hp','30')+input('力量','cb-ae-str','12')+input('敏捷','cb-ae-agi','14')+input('体质','cb-ae-con','10')+'<div style="display:flex;gap:6px;margin-top:12px;"><button id="cb-ae-ok" style="flex:1;background:rgba(167,139,250,0.2);border:1px solid rgba(167,139,250,0.4);border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer;color:#a78bfa;font-weight:600;">加入战场</button><button id="cb-ae-cancel" style="background:rgba(255,255,255,0.5);border:1px solid rgba(255,255,255,0.7);border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer;color:#463f63;">取消</button></div></div>';
+    HOST.document.body.appendChild(overlay);
+    overlay.querySelector('#cb-ae-cancel').onclick=function(){ overlay.remove(); };
+    overlay.querySelector('#cb-ae-ok').onclick=function(){
+      var name=overlay.querySelector('#cb-ae-name').value.trim(); if(!name){ overlay.querySelector('#cb-ae-name').focus(); return; }
+      var hp=parseInt(overlay.querySelector('#cb-ae-hp').value,10)||30;
+      var str=parseInt(overlay.querySelector('#cb-ae-str').value,10)||12;
+      var agi=parseInt(overlay.querySelector('#cb-ae-agi').value,10)||14;
+      var con=parseInt(overlay.querySelector('#cb-ae-con').value,10)||10;
+      var en2=makeEnemy(name,hp,str,agi,con,8,8,8); calcDerived(en2); state.units.push(en2); state.targetIdx=state.units.length-1;
+      addLog(state,name+'加入战场(HP '+hp+')'); saveCombatState(state); renderAllPanels(); overlay.remove();
+    };
+  }
+
   /* ===== 战报构建 ===== */
   function buildReport(state, action, rpText, phaseLabel){
     var p=state.units.find(function(u){return u.isPlayer;});
@@ -736,6 +910,12 @@
     /* A8兜底：参战角色lore注入snapshot */
     var loreStr=buildRosterLoreSnippet(state);
     if(loreStr)snapshot+='\n'+loreStr;
+    /* <pos> 站位同步：把最新坐标注入AI（system inject） + 同步一行到战报tab */
+    var posBlock=buildPositionsBlock(state);
+    if(posBlock){
+      snapshot+='\n【当前站位（权威）】\n'+posBlock;
+      addLog(state,'[站位] '+posBlock.replace(/<\/?pos>/g,'').replace(/\r?\n/g,' ').trim());
+    }
     /* A3 滑动窗口：近5回合全文narratives + 更早digests */
     var nas=state.narratives||[];
     var dis=state.digests||[];
@@ -747,10 +927,11 @@
     /* 自适应prompt：_pendingAIUnits 存放需要AI决策的单位名 */
     var needAIList=state._pendingAIUnits||[];
     var promptTail;
+    var posTeach='\n若本回合有角色移动，请在</summary>后输出一行格式为<pos>名称|(x,y)</pos>的站位块（每个角色一行，玩家可写其代号/姓名/或"玩家"二字），前端只读取你回复中最后一次出现的<pos>块并作为回合结束时的最终权威站位。';
     if(needAIList.length){
-      promptTail='\n\n请演绎战斗(<content>...</content>)，</content>后生成摘要(<summary>...</summary>)。\n以下单位无前端逻辑，请为其输出行动标签：'+needAIList.join('、')+'。\n格式：<enemy_action>行动者|行动类型|目标|参数</enemy_action> 或 <ally_action>队友名|行动类型|目标|参数</ally_action>。\n不要自行计算数值（命中/伤害/DB/闪避/格挡/AOE全由前端结算）。';
+      promptTail='\n\n请演绎战斗(<content>...</content>)，</content>后生成摘要(<summary>...</summary>)。\n以下单位无前端逻辑，请为其输出行动标签：'+needAIList.join('、')+'。\n格式：<enemy_action>行动者|行动类型|目标|参数</enemy_action> 或 <ally_action>队友名|行动类型|目标|参数</ally_action>。\n不要自行计算数值（命中/伤害/DB/闪避/格挡/AOE全由前端结算）。'+posTeach;
     } else {
-      promptTail='\n\n请演绎战斗(<content>...</content>)，</content>后生成摘要(<summary>...</summary>)。\n所有单位均由前端决策，无需输出<enemy_action>/<ally_action>。\n不要自行计算数值（命中/伤害/DB/闪避/格挡/AOE全由前端结算）。';
+      promptTail='\n\n请演绎战斗(<content>...</content>)，</content>后生成摘要(<summary>...</summary>)。\n所有单位均由前端决策，无需输出<enemy_action>/<ally_action>。\n不要自行计算数值（命中/伤害/DB/闪避/格挡/AOE全由前端结算）。'+posTeach;
     }
     var userInput=report+history+promptTail;
     if(typeof generate!=='function')throw new Error('generate函数不可用，请确保酒馆助手已安装');
@@ -985,6 +1166,9 @@
       if(allyReports.length){ addLog(state,'【队友行动结算】\n'+allyReports.join('\n---\n')); }
     }
     if(checkCombatEnd(state))return;
+    /* 最后应用AI回复中的<pos>（取最后一次出现），作为回合结束时的权威站位，
+       覆盖 enemy_action/ally_action 增量移动之后的结果 */
+    applyPositions(state,reply);
     state._pendingAIUnits=null;
     tick(state);
     state.phase='PLAYER_ACTING'; saveCombatState(state); renderAllPanels();
@@ -1161,7 +1345,7 @@
     });
     return results;
   }
-  /* ===== 玩家攻击（使用装备公式 + A9双手力量需求 + 射击专精 + AOE分层） ===== */
+  /* ===== 玩家攻击（持械动态计价 + 双持自动流程 + AOE武器半径 + 队列可回滚） ===== */
   function doPlayerAttack(state, targetIdx, isAOE, aoeRadius, rpText){
     var p=getControlledUnit(state); if(!p||p.hp<=0)return;
     var d=fetchStatData();
@@ -1176,50 +1360,51 @@
       if(weapon.伤害)damageExpr=weapon.伤害;
       if(weapon.伤害类型)damageType=weapon.伤害类型;
       critThreshold=20; critMult=2;
-      weapon._effects.forEach(function(eff){
+      (weapon._effects||[]).forEach(function(eff){
         if(eff.effect==='roll_mod'&&eff.rollTarget==='damage')triggeredEffects.push(eff);
         if(eff.effect==='debuff_apply')triggeredEffects.push(eff);
       });
     }
     if(p.atkType==='magic'){ hitExpr='r智力'; if(!weapon)damageType='魔法'; }
 
-    /* A9: 双手武器力量需求 — 需求>力量×1.5不可用；超单手未达双手+1AP */
-    var str=num(p.eff?p.eff['力量']:p.attrs['力量'],10);
-    var apCost=(weaponType==='twohand')?3:2;
-    if(weaponType==='twohand'){
-      var req=Math.ceil(str*1.5);
-      /* 双手武器力量需求：若力量<武器需求(默认12)则+1AP */
-      var wreq=weapon?(num(weapon.装备要求&&weapon.装备要求.match(/力量(\d+)/),12)||12):12;
-      if(str<wreq)apCost+=1;
-    }
+    /* 持械动态计价：单手2 / 双持4(自动走双持流程) / 双手3(力量不达标+1) */
+    var am=getAttackMode(p,d);
+    if(am.mode==='dual'&&!isAOE){ return doDualWield(state,targetIdx,rpText); }
+    var apCost=isAOE?((weaponType==='twohand')?3:2):am.apCost;
 
-    if(p.ap<apCost){ addLog(state,'AP不足（需'+apCost+'）'); return; }
+    if(p.ap<apCost){ addLog(state,'AP不足（需'+apCost+'）'); if(typeof toastr!=='undefined')toastr.warning('AP不足（需'+apCost+'AP），无法'+(isAOE?'AOE攻击':'攻击')); saveCombatState(state); renderAllPanels(); return; }
 
     if(isAOE){
-      var radius=num(aoeRadius,2);
+      /* AOE半径：优先调用方指定(1-5)，否则按武器"范围"数据自动确定，不再询问玩家 */
+      var radius=(aoeRadius!=null&&!isNaN(parseFloat(aoeRadius)))?clamp(Math.round(num(aoeRadius,2)),1,5):weaponAOERadius(weapon);
       var targets=unitsInAOE(p,radius,state.units.filter(function(u){return !u.isPlayer&&!u.isAlly;}));
-      if(!targets.length){ addLog(state,'AOE范围内无目标'); return; }
+      if(!targets.length){ addLog(state,'AOE范围内无目标（半径'+radius+'格）'); if(typeof toastr!=='undefined')toastr.warning('AOE半径'+radius+'格内没有敌人，先靠近目标！'); saveCombatState(state); return; }
+      var tIdx=targets.map(function(t){return state.units.indexOf(t);});
+      var hpB=targets.map(function(t){return t.hp;});
+      var bfB=targets.map(function(t){return (t.buffs||[]).length;});
       var allResults=resolveAOEAttack(p,targets,state,{hitExpr:hitExpr,damageExpr:damageExpr,damageType:damageType,critThreshold:critThreshold,critMultiplier:critMult,triggeredEffects:triggeredEffects,aoeRadius:radius,weaponType:weaponType});
       var hit=nebDice(hitExpr,p,'attack');
-      var actionStr='AOE攻击 命中'+hitExpr+'='+hit.total+(hit.crit?'(大成功)':'')+(hit.fumble?'(大失败)':'')+'\n';
+      var actionStr='AOE攻击(半径'+radius+'格) 命中'+hitExpr+'='+hit.total+(hit.crit?'(大成功)':'')+(hit.fumble?'(大失败)':'')+'\n';
       allResults.forEach(function(s){ actionStr+=s+'\n'; });
       costAP(p,apCost);
       actionStr+='消耗'+apCost+'AP/'+(apCost*5)+'HP(耐力)';
       var report=buildReport(state,actionStr,rpText,'AOE攻击');
       addLog(state,report);
-      addActionToQueue(state,{type:'aoe',report:actionStr,rpText:rpText});
+      addActionToQueue(state,{type:'aoe',report:actionStr,rpText:rpText,undo:{apCost:apCost,staminaHp:apCost*5,restores:targets.map(function(t,i){return {idx:tIdx[i],hp:hpB[i]-t.hp,buffCut:((t.buffs||[]).length)-bfB[i]};})}});
       return;
     }
 
     var def=state.units[targetIdx]||state.units.find(function(u){return !u.isPlayer&&!u.isAlly;});
-    if(!def||def.hp<=0){ addLog(state,'无有效目标'); return; }
-    if(!inRange(p,def,weaponType)){ addLog(state,'目标超出射程！距离='+distance(p,def)+'米'); return; }
+    if(!def||def.hp<=0){ addLog(state,'无有效目标'); if(typeof toastr!=='undefined')toastr.warning('没有可攻击的目标'); saveCombatState(state); return; }
+    if(!inRange(p,def,weaponType)){ addLog(state,'目标超出射程！距离='+distance(p,def)+'米'); if(typeof toastr!=='undefined')toastr.warning('目标超出射程（距离'+distance(p,def)+'米），先用 走/跑 靠近！'); saveCombatState(state); renderAllPanels(); return; }
 
+    var defIdx=state.units.indexOf(def);
+    var hpBefore=def.hp; var buffsBefore=(def.buffs||[]).length;
     var r=resolveAttack(p,def,state,{hitExpr:hitExpr,damageExpr:damageExpr,damageType:damageType,critThreshold:critThreshold,critMultiplier:critMult,triggeredEffects:triggeredEffects,weaponType:weaponType});
     costAP(p,apCost);
-    var actionStr=r.summary+'\n消耗'+apCost+'AP/'+(apCost*5)+'HP(耐力) | AP→'+p.ap;
+    var actionStr=r.summary+'\n消耗'+apCost+'AP/'+(apCost*5)+'HP(耐力) | AP->'+p.ap;
     if(weapon&&r.hitSuccess){
-      weapon._effects.forEach(function(eff){
+      (weapon._effects||[]).forEach(function(eff){
         if(eff.effect==='debuff_apply'){
           if(!def.buffs)def.buffs=[];
           def.buffs.push({name:eff.name,effect:'debuff_apply',formula:eff.formula,turns:eff.duration||2,target:'enemy'});
@@ -1229,32 +1414,33 @@
     }
     var report=buildReport(state,actionStr,rpText,damageType==='魔法'?'法术攻击':'物理攻击');
     addLog(state,report);
-    addActionToQueue(state,{type:'attack',report:actionStr,rpText:rpText});
+    addActionToQueue(state,{type:'attack',report:actionStr,rpText:rpText,undo:{apCost:apCost,staminaHp:apCost*5,restores:[{idx:defIdx,hp:hpBefore-def.hp,buffCut:((def.buffs||[]).length)-buffsBefore}]}});
   }
 
   /* ===== 闪避/格挡/移动/自由投骰 — 加入pendingActions + 标记效果(A9修复生效) ===== */
   function doDodge(state, rpText){
-    var p=getControlledUnit(state); if(!p||p.ap<1){ addLog(state,'AP不足（需1）'); return; }
+    var p=getControlledUnit(state); if(!p||p.ap<1){ addLog(state,'AP不足（需1）'); if(typeof toastr!=='undefined')toastr.warning('AP不足（需1AP），无法闪避'); saveCombatState(state); return; }
     costAP(p,1); markDodge(p); /* A9: 标记闪避，resolveAttack时消费 */
-    var action='玩家闪避(已标记，受击时结算) \n消耗1AP/5HP(耐力) | AP→'+p.ap;
+    var action='玩家闪避(已标记，受击时结算) \n消耗1AP/5HP(耐力) | AP->'+p.ap;
     var report=buildReport(state,action,rpText,'闪避'); addLog(state,report);
-    addActionToQueue(state,{type:'dodge',report:action,rpText:rpText});
+    addActionToQueue(state,{type:'dodge',report:action,rpText:rpText,undo:{apCost:1,staminaHp:5}});
   }
   function doParry(state, ptype, rpText){
-    var p=getControlledUnit(state); if(!p||p.ap<1){ addLog(state,'AP不足（需1）'); return; }
+    var p=getControlledUnit(state); if(!p||p.ap<1){ addLog(state,'AP不足（需1）'); if(typeof toastr!=='undefined')toastr.warning('AP不足（需1AP），无法格挡'); saveCombatState(state); return; }
     costAP(p,1); markParry(p,ptype); /* A9: 标记格挡，resolveAttack时消费 */
     var label={weapon:'武器格挡',shield2h:'双手盾格挡',shield1h:'单手盾格挡',barehand:'空手格挡'}[ptype]||'格挡';
-    var action='玩家'+label+'(已标记，受击时结算) \n消耗1AP/5HP(耐力) | AP→'+p.ap;
+    var action='玩家'+label+'(已标记，受击时结算) \n消耗1AP/5HP(耐力) | AP->'+p.ap;
     var report=buildReport(state,action,rpText,label); addLog(state,report);
-    addActionToQueue(state,{type:'parry',report:action,rpText:rpText});
+    addActionToQueue(state,{type:'parry',report:action,rpText:rpText,undo:{apCost:1,staminaHp:5}});
   }
   function doMove(state, mode, rpText){
     var p=getControlledUnit(state); if(!p)return;
-    var apCost=(mode==='run')?2:1; if(p.ap<apCost){ addLog(state,'AP不足（需'+apCost+'）'); return; }
+    var apCost=(mode==='run')?2:1; if(p.ap<apCost){ addLog(state,'AP不足（需'+apCost+'）'); if(typeof toastr!=='undefined')toastr.warning('AP不足（需'+apCost+'AP），无法移动'); saveCombatState(state); return; }
     var spd=Math.floor(num(p.eff['敏捷'],10)/5); var dist=(mode==='run')?spd*3:spd;
+    var prevX=p.x, prevY=p.y;
     if(mode==='run'){ p.hp-=40; if(p.hp<0)p.hp=0; } costAP(p,apCost);
     p._isMoving=true; /* A9: 移动状态受击闪避减半，下回合tick清除 */
-    /* A6: 如果有地形且有目标，用pathfind移动；否则直线移动 */
+    /* A6: 如果有地形且有目标，用pathfind移动；否则朝目标方向直线移动 */
     var moved=0;
     if(state.terrain&&state.targetIdx!=null&&state.units[state.targetIdx]){
       var tgt=state.units[state.targetIdx];
@@ -1266,20 +1452,32 @@
         }
       }
     } else {
-      /* 无地形：直线朝目标移动 */
-      p.x=clamp(p.x+dist,p.x,99); moved=dist;
+      /* 无地形：朝当前目标方向移动（修复原来只能朝+x方向移动的问题） */
+      var tgt2=state.units[state.targetIdx];
+      if(tgt2&&tgt2!==p){
+        var dx=tgt2.x-p.x, dy=tgt2.y-p.y;
+        var half=Math.floor(dist/2);
+        if(Math.abs(dx)>=Math.abs(dy)){
+          p.x=clamp(p.x+(dx>0?dist:(dx<0?-dist:0)),Math.min(p.x,tgt2.x),Math.max(p.x,tgt2.x));
+          p.y=clamp(p.y+(dy>0?half:(dy<0?-half:0)),Math.min(p.y,tgt2.y),Math.max(p.y,tgt2.y));
+        } else {
+          p.y=clamp(p.y+(dy>0?dist:(dy<0?-dist:0)),Math.min(p.y,tgt2.y),Math.max(p.y,tgt2.y));
+          p.x=clamp(p.x+(dx>0?half:(dx<0?-half:0)),Math.min(p.x,tgt2.x),Math.max(p.x,tgt2.x));
+        }
+      } else { p.x=clamp(p.x+dist,0,99); }
+      moved=dist;
     }
     var label=(mode==='run')?'跑步':'走路';
-    var action='玩家'+label+' 移动'+moved+'米'+(mode==='run'?' (额外消耗40HP)':'')+'\n消耗'+apCost+'AP/'+((apCost*5)+(mode==='run'?40:0))+'HP(耐力) | AP→'+p.ap;
+    var action='玩家'+label+' 移动'+moved+'米'+(mode==='run'?' (额外消耗40HP)':'')+'\n消耗'+apCost+'AP/'+((apCost*5)+(mode==='run'?40:0))+'HP(耐力) | AP->'+p.ap;
     var report=buildReport(state,action,rpText,label); addLog(state,report);
-    addActionToQueue(state,{type:'move',report:action,rpText:rpText});
+    addActionToQueue(state,{type:'move',report:action,rpText:rpText,undo:{apCost:apCost,staminaHp:apCost*5+(mode==='run'?40:0),dx:p.x-prevX,dy:p.y-prevY}});
   }
   function doFreeRoll(state, expr, rpText){
     var p=getControlledUnit(state); if(p)calcDerived(p);
     var r=nebDice(expr,p,'custom');
     var action='自由投骰: '+expr+'\n'+r.detail+' = '+r.total+(r.crit?' [大成功]':'')+(r.fumble?' [大失败]':'');
     var report=buildReport(state,action,rpText,'自由投骰'); addLog(state,report);
-    renderAllPanels();
+    saveCombatState(state); renderAllPanels();
   }
 
   /* ===== Buff/Debuff管理 ===== */
@@ -1442,38 +1640,40 @@
 
   /* ===== 反击/双持/投掷 — 加入pendingActions ===== */
   function doCounter(state, targetIdx, rpText){
-    var p=getControlledUnit(state); if(!p||p.ap<1){ addLog(state,'AP不足（反击需要1AP）'); return; }
+    var p=getControlledUnit(state); if(!p||p.ap<1){ addLog(state,'AP不足（反击需要1AP）'); if(typeof toastr!=='undefined')toastr.warning('AP不足（反击需要1AP）'); saveCombatState(state); return; }
     p.ap-=1; p.hp-=5; if(p.hp<0)p.hp=0;
-    /* A9: 反击标记 — 放弃闪避，受击时反击 */
+    /* A9: 反击标记 - 放弃闪避，受击时反击 */
     p._isCountering=true;
-    var action='玩家反击！放弃闪避，消耗1AP进行反击攻击\n（受击时结算反击伤害）\n消耗1AP/5HP(耐力) | AP→'+p.ap;
+    var action='玩家反击！放弃闪避，消耗1AP进行反击攻击\n（受击时结算反击伤害）\n消耗1AP/5HP(耐力) | AP->'+p.ap;
     var report=buildReport(state,action,rpText,'反击'); addLog(state,report);
-    addActionToQueue(state,{type:'counter',report:action,rpText:rpText});
+    addActionToQueue(state,{type:'counter',report:action,rpText:rpText,undo:{apCost:1,staminaHp:5}});
   }
   function doDualWield(state, targetIdx, rpText){
-    var p=getControlledUnit(state); if(!p||p.hp<=0)return; if(p.ap<4){ addLog(state,'双持攻击需要4AP'); return; }
-    var def=state.units[targetIdx]||state.units.find(function(u){return !u.isPlayer&&u.hp>0;}); if(!def){ addLog(state,'无有效目标'); return; }
+    var p=getControlledUnit(state); if(!p||p.hp<=0)return; if(p.ap<4){ addLog(state,'双持攻击需要4AP'); if(typeof toastr!=='undefined')toastr.warning('双持攻击需要4AP，当前AP不足'); saveCombatState(state); return; }
+    var def=state.units[targetIdx]||state.units.find(function(u){return !u.isPlayer&&u.hp>0;}); if(!def){ addLog(state,'无有效目标'); if(typeof toastr!=='undefined')toastr.warning('没有可攻击的目标'); saveCombatState(state); return; }
+    var defIdx=state.units.indexOf(def);
+    var hpBefore=def.hp;
     var mainHit=nebDice('r力量',p,'attack');
     var hitPen=rollDie(10); var dmgPen=rollDie(5);
     var offHitTotal=mainHit.total-hitPen;
     var dodge=nebDice('rd敏捷',def,'dodge');
-    var action='玩家双持攻击 → '+def.name+'\n主手命中 r力量='+mainHit.detail+'='+mainHit.total+'\n副手命中(主手-d10) '+mainHit.total+'-d10='+hitPen+'='+offHitTotal+'\n'+def.name+'闪避 rd敏捷='+dodge.detail+'='+dodge.total+'\n';
+    var action='玩家双持攻击 -> '+def.name+'\n主手命中 r力量='+mainHit.detail+'='+mainHit.total+'\n副手命中(主手-d10) '+mainHit.total+'-d10='+hitPen+'='+offHitTotal+'\n'+def.name+'闪避 rd敏捷='+dodge.detail+'='+dodge.total+'\n';
     var mainSuccess=mainHit.total>dodge.total, offSuccess=offHitTotal>dodge.total;
-    action+='主手→ '+(mainSuccess?'命中':'未命中')+' | 副手→ '+(offSuccess?'命中':'未命中')+'\n';
+    action+='主手-> '+(mainSuccess?'命中':'未命中')+' | 副手-> '+(offSuccess?'命中':'未命中')+'\n';
     var totalDmg=0;
     if(mainSuccess){ var d1=nebDice('d4+DB',p,'damage'); totalDmg+=d1.total; action+='主手伤害 '+d1.detail+'='+d1.total+'\n'; }
     if(offSuccess){ var d2=nebDice('d4+DB',p,'damage'); var offDmg=Math.max(0,d2.total-dmgPen); totalDmg+=offDmg; action+='副手伤害 '+d2.detail+'='+d2.total+'-d5='+dmgPen+'='+offDmg+'\n'; }
     if(totalDmg>0){ def.hp-=totalDmg; if(def.hp<0)def.hp=0; action+=def.name+' HP '+def.hp+'\n'; }
     p.ap-=4; p.hp-=20; if(p.hp<0)p.hp=0;
-    action+='消耗4AP/20HP(耐力) | AP→'+p.ap;
+    action+='消耗4AP/20HP(耐力) | AP->'+p.ap;
     var report=buildReport(state,action,rpText,'双持攻击'); addLog(state,report);
-    addActionToQueue(state,{type:'dualwield',report:action,rpText:rpText});
+    addActionToQueue(state,{type:'dualwield',report:action,rpText:rpText,undo:{apCost:4,staminaHp:20,restores:[{idx:defIdx,hp:hpBefore-def.hp}]}});
   }
   function doThrow(state, targetIdx, rpText){
-    var p=getControlledUnit(state); if(!p||p.hp<=0)return; if(p.ap<2){ addLog(state,'投掷需要2AP'); return; }
-    var def=state.units[targetIdx]||state.units.find(function(u){return !u.isPlayer&&!u.isAlly&&u.hp>0;}); if(!def){ addLog(state,'无有效目标'); return; }
+    var p=getControlledUnit(state); if(!p||p.hp<=0)return; if(p.ap<2){ addLog(state,'投掷需要2AP'); if(typeof toastr!=='undefined')toastr.warning('投掷需要2AP，当前AP不足'); saveCombatState(state); return; }
+    var def=state.units[targetIdx]||state.units.find(function(u){return !u.isPlayer&&!u.isAlly&&u.hp>0;}); if(!def){ addLog(state,'无有效目标'); if(typeof toastr!=='undefined')toastr.warning('没有可投掷的目标'); saveCombatState(state); return; }
     var str=num(p.eff?p.eff['力量']:p.attrs['力量'],10);
-    var dist=distance(p,def); if(dist>str){ addLog(state,'超出投掷距离！距离='+dist+'米，最大='+str+'米'); return; }
+    var dist=distance(p,def); if(dist>str){ addLog(state,'超出投掷距离！距离='+dist+'米，最大='+str+'米'); if(typeof toastr!=='undefined')toastr.warning('超出投掷距离（'+dist+'米 > 最大'+str+'米）'); saveCombatState(state); return; }
     var halfStr=Math.floor(str/2); if(halfStr<1)halfStr=1;
     /* A9: 投掷命中=d力量/2(取低)+投掷难易度+射击专精 */
     var profThrowBonus='';
@@ -1482,12 +1682,14 @@
     var dodge=nebDice('rd敏捷',def,'dodge');
     if(def._isMoving)dodge.total=Math.floor(dodge.total/2);
     var hitSuccess=throwRoll.total>dodge.total;
-    var action='玩家投掷攻击 → '+def.name+' (距离'+dist+'米/最大'+str+'米)\n投掷命中 d'+halfStr+(profThrowBonus?('+'+profThrowBonus):'')+'='+throwRoll.total+(profThrowBonus?' [专精]':'')+'\n'+def.name+'闪避 rd敏捷='+dodge.detail+'='+dodge.total+'\n→ '+(hitSuccess?'命中':'未命中')+'\n';
-    if(hitSuccess){ var dmg=nebDice('d4+DB',p,'damage'); var dmgDealt=Math.max(1,dmg.total-def.derived.physDef); def.hp-=dmgDealt; if(def.hp<0)def.hp=0; action+='伤害 '+dmg.detail+'='+dmg.total+' → '+dmgDealt+'\n'+def.name+' HP '+def.hp; }
+    var defIdx=state.units.indexOf(def);
+    var hpBefore=def.hp;
+    var action='玩家投掷攻击 -> '+def.name+' (距离'+dist+'米/最大'+str+'米)\n投掷命中 d'+halfStr+(profThrowBonus?('+'+profThrowBonus):'')+'='+throwRoll.total+(profThrowBonus?' [专精]':'')+'\n'+def.name+'闪避 rd敏捷='+dodge.detail+'='+dodge.total+'\n-> '+(hitSuccess?'命中':'未命中')+'\n';
+    if(hitSuccess){ var dmg=nebDice('d4+DB',p,'damage'); var dmgDealt=Math.max(1,dmg.total-def.derived.physDef); def.hp-=dmgDealt; if(def.hp<0)def.hp=0; action+='伤害 '+dmg.detail+'='+dmg.total+' -> '+dmgDealt+'\n'+def.name+' HP '+def.hp; }
     p.ap-=2; p.hp-=10; if(p.hp<0)p.hp=0;
-    action+='\n消耗2AP/10HP(耐力) | AP→'+p.ap;
+    action+='\n消耗2AP/10HP(耐力) | AP->'+p.ap;
     var report=buildReport(state,action,rpText,'投掷攻击'); addLog(state,report);
-    addActionToQueue(state,{type:'throw',report:action,rpText:rpText});
+    addActionToQueue(state,{type:'throw',report:action,rpText:rpText,undo:{apCost:2,staminaHp:10,restores:[{idx:defIdx,hp:hpBefore-def.hp}]}});
   }
 
   /* ===== 敌方行动解析 ===== */
@@ -1552,7 +1754,8 @@
   }
   function checkSkillRegister(){
     try{
-      var msgs=getChatMessages('0-{{lastMessageId}}'); if(!msgs||!msgs.length)return;
+      var lidSr=lastMsgIdSafe();
+      var msgs=lidSr!=null?getChatMessages('0-'+lidSr):null; if(!msgs||!msgs.length)return;
       var lastMsg=msgs[msgs.length-1]; var text=lastMsg.message||lastMsg.mes||'';
       var skills=parseSkillRegister(text); if(skills.length===0)return;
       var state=getCombatState();
@@ -1560,12 +1763,21 @@
       if(state&&state.active){ saveCombatState(state); renderAllPanels(); }
     }catch(e){ console.error('[战斗引擎v6] 技能注册检查失败',e); }
   }
+  /* 已处理过spawn的楼层ID（模块级存续，即使战斗状态被清空也能防止重复刷怪/战斗复活） */
+  var handledSpawnMsgIds=[];
   function checkEnemySpawn(){
     try{
-      var msgs=getChatMessages('0-{{lastMessageId}}'); if(!msgs||!msgs.length)return;
+      var lidEs=lastMsgIdSafe();
+      var msgs=lidEs!=null?getChatMessages('0-'+lidEs):null; if(!msgs||!msgs.length)return;
       var lastMsg=msgs[msgs.length-1]; var text=lastMsg.message||lastMsg.mes||'';
+      var mid=(lastMsg&&lastMsg.message_id!=null)?lastMsg.message_id:null;
       var spawns=parseEnemySpawn(text); if(spawns.length===0)return;
       var state=getCombatState();
+      /* 幂等防护：CHARACTER_MESSAGE_RENDERED/MESSAGE_UPDATED/GENERATION_ENDED 会对同一楼层重复触发，
+         同一楼层消息的spawn只处理一次（否则同一批怪被当援军重复push -> 卡片重复） */
+      var handledInState=!!(state&&state.spawnHandledMsgIds&&mid!=null&&state.spawnHandledMsgIds.indexOf(mid)>=0);
+      if(mid!=null&&(handledSpawnMsgIds.indexOf(mid)>=0||handledInState)){ if(handledSpawnMsgIds.indexOf(mid)<0)handledSpawnMsgIds.push(mid); return; }
+      if(mid!=null)handledSpawnMsgIds.push(mid);
       /* B2 自动启动桥：无活跃战斗且检测到<enemy_spawn> → 自动enterCombat */
       if(!state||!state.active){
         try{
@@ -1573,12 +1785,14 @@
           var allySpawns=parseAllySpawn(text);
           var allies=allySpawns.map(function(s){return {name:s.name,hp:s.hp,str:s.str,agi:s.agi,con:s.con,int:s.int,spi:s.spi,cha:s.cha};});
           if(typeof HOST.enterCombat==='function'){
-            HOST.enterCombat({enemies:enemies,allies:allies},{injectCombatHud:true}).then(function(){
+            HOST.enterCombat({enemies:enemies,allies:allies},{injectCombatHud:true,posText:text,spawnMsgId:mid}).then(function(){
               /* 同步logic/script/terrain到生成的state */
               var st=getCombatState(); if(st){
+                if(mid!=null){ if(!st.spawnHandledMsgIds)st.spawnHandledMsgIds=[]; if(st.spawnHandledMsgIds.indexOf(mid)<0)st.spawnHandledMsgIds.push(mid); }
                 var logic=parseEnemyLogic(text); var script=parseScriptBlock(text,'enemy_script');
                 st.units.forEach(function(u){ if(!u.isPlayer&&!u.isAlly){ if(logic)u.logic=logic; if(script)u.script=script; } });
-                var terrain=parseTerrain(text); if(terrain)st.terrain=terrain;
+                var terrain=parseTerrain(text); if(!st.terrain&&terrain)st.terrain=terrain;
+                applyPositions(st,text);
                 saveCombatState(st); renderAllPanels();
               }
               if(typeof toastr!=='undefined')toastr.success('检测到敌人，自动进入战斗！');
@@ -1587,8 +1801,10 @@
         }catch(e){ console.error('[战斗引擎v6] 自动启动战斗失败',e); }
         return;
       }
-      /* 已在战斗中：作为援军加入 */
+      /* 已在战斗中：作为援军加入（记录楼层ID，防止同一消息重复刷援军） */
+      if(mid!=null){ if(!state.spawnHandledMsgIds)state.spawnHandledMsgIds=[]; if(state.spawnHandledMsgIds.indexOf(mid)<0)state.spawnHandledMsgIds.push(mid); }
       spawns.forEach(function(s){ var en=makeEnemy(s.name,s.hp,s.str,s.agi,s.con,s.int||8,s.spi||8,s.cha||8); calcDerived(en); state.units.push(en); addToRosterFromSpawn(s,'enemy',text); addLog(state,'★ 敌方援军加入: '+s.name+' HP'+s.hp); });
+      applyPositions(state,text);
       saveCombatState(state); renderAllPanels();
     }catch(e){ console.error('[战斗引擎v6] 敌人生成检查失败',e); }
   }
@@ -1622,7 +1838,7 @@
       var isControlled=state_controlledId===u.id;
       h+='<button class="'+idPrefix+'-ctrl-btn'+(isControlled?' active':'')+'" data-act="controlswitch" data-unit-id="'+esc(u.id)+'" style="font-size:9px;padding:2px 6px;margin-bottom:4px;'+(isControlled?'border-color:#48bb78;color:#48bb78;':'')+'">'+(isControlled?'● 操控中':'切换操控')+'</button>';
     }
-    h+='<div class="'+idPrefix+'-bar-line"><span class="'+idPrefix+'-bar-label">HP</span>'+bar(hpPct,hpPct<30?'hp low':'hp',idPrefix)+'<span class="'+idPrefix+'-bar-val">'+u.hp+'/'+u.derived.hpMax+'<span class="'+idPrefix+'-hp-ctrl"><button data-hp="'+idx+'" data-d="-5">-</button><button data-hp="'+idx+'" data-d="5">+</button></span></span></div>';
+    h+='<div class="'+idPrefix+'-bar-line"><span class="'+idPrefix+'-bar-label">HP</span>'+bar(hpPct,hpPct<30?'hp low':'hp',idPrefix)+'<span class="'+idPrefix+'-bar-val">'+u.hp+'/'+u.derived.hpMax+'</span></div>';
     if(u.derived.energyMax>0){ h+='<div class="'+idPrefix+'-bar-line"><span class="'+idPrefix+'-bar-label">'+esc((u.energyType||'能量').slice(0,2))+'</span>'+bar(enPct,'energy',idPrefix)+'<span class="'+idPrefix+'-bar-val">'+u.energy+'/'+u.derived.energyMax+'</span></div>'; }
     h+='<div class="'+idPrefix+'-ap-row"><span class="'+idPrefix+'-ap-label">AP</span>'+apDots(u.ap,u.derived.apMax,idPrefix)+'<span class="'+idPrefix+'-ap-info">'+u.ap+'/'+u.derived.apMax+'</span></div>';
     /* Equipment slots for player */
@@ -2039,24 +2255,24 @@
     }
     if(act==='endcombat'){ addLog(state,'-- 战斗结束（手动） --'); finalizeCombatMessage(state,'战斗结束（手动）'); return; }
     if(act==='endturn'){ if(!state.active)return; endTurn(state); return; }
-    if(act==='removepending'){ if(state.pendingActions){ state.pendingActions.splice(parseInt(data.pidx,10),1); saveCombatState(state); renderAllPanels(); } return; }
+    if(act==='removepending'){ if(state.pendingActions){ var pi=parseInt(data.pidx,10); var pa=state.pendingActions[pi]; state.pendingActions.splice(pi,1); undoPendingAction(state,pa); requeueMarks(state); addLog(state,'已移除并回滚队列行动'+(pa&&pa.type?('·'+pa.type):'')); saveCombatState(state); renderAllPanels(); } return; }
     if(!state.active)return;
     if(state.phase==='AI_GENERATING'||state.phase==='ENEMY_RESOLVING')return;
     if(state.phase!=='PLAYER_ACTING')return;
     var rpText=''; try{ var rpInput=mount.querySelector('#cb-rp-input'); if(rpInput)rpText=rpInput.value.trim(); }catch(e){}
     if(act==='attack'){ doPlayerAttack(state,state.targetIdx||1,false,0,rpText); renderAllPanels(); return; }
-    if(act==='aoe'){ var radius=prompt('AOE范围半径(格)：','2'); if(radius)doPlayerAttack(state,state.targetIdx||1,true,parseInt(radius,10),rpText); renderAllPanels(); return; }
+    if(act==='aoe'){ doPlayerAttack(state,state.targetIdx||1,true,null,rpText); renderAllPanels(); return; }
     if(act==='dodge'){ doDodge(state,rpText); renderAllPanels(); return; }
     if(act==='parry'){ doParry(state,data.pt||'weapon',rpText); renderAllPanels(); return; }
     if(act==='move'){ doMove(state,data.mode||'walk',rpText); renderAllPanels(); return; }
     if(act==='freeroll'){ var input=mount.querySelector('#cb-dice-expr'); doFreeRoll(state,input?input.value:'d20',rpText); renderAllPanels(); return; }
-    if(act==='customaction'){ if(!rpText){ addLog(state,'请在RP输入框描述你的行动'); return; } var rollType=prompt('选择投骰类型（留空=不投骰纯RP）：\nr力量 / rd敏捷 / r智力 / d20 / d100 / 3d6',''); if(rollType===null)return; rollType=rollType.trim(); doCustomAction(state,rpText,rollType); renderAllPanels(); return; }
+    if(act==='customaction'){ if(!rpText){ addLog(state,'请在RP输入框描述你的行动'); if(typeof toastr!=='undefined')toastr.warning('请先在RP输入框描述你的行动'); return; } openRollTypeModal(state,rpText); return; }
     if(act==='atktype'){ var p=getControlledUnit(state); if(p){ p.atkType=(p.atkType==='magic'?'phys':'magic'); saveCombatState(state); renderAllPanels(); } return; }
     if(act==='wtype'){ var pw=getControlledUnit(state); if(pw){ pw.weaponType=(pw.weaponType==='twohand'?'onehand':'twohand'); saveCombatState(state); renderAllPanels(); } return; }
-    if(act==='addenemy'){ var name=prompt('敌人名称：','哥布林'); if(!name)return; var hp=parseInt(prompt('HP：','30')||'30',10); var str=prompt('力量(默认12)：','12')||12; var agi=prompt('敏捷(默认14)：','14')||14; var con=prompt('体质(默认10)：','10')||10; var en2=makeEnemy(name,hp,str,agi,con,8,8,8); calcDerived(en2); state.units.push(en2); state.targetIdx=state.units.length-1; addLog(state,name+'加入战场(HP '+hp+')'); saveCombatState(state); renderAllPanels(); return; }
+    if(act==='addenemy'){ openAddEnemyModal(state); return; }
     if(act==='addbuff'){ openBuffModal(state); return; }
     if(act==='counter'){ doCounter(state,state.targetIdx||1,rpText); renderAllPanels(); return; }
-    if(act==='dualwield'){ doDualWield(state,state.targetIdx||1,rpText); renderAllPanels(); return; }
+
     if(act==='throw'){ doThrow(state,state.targetIdx||1,rpText); renderAllPanels(); return; }
     if(act==='skilledit'){ openSkillEditor(); return; }
     if(act==='useitem'){ doUseConsumable(state,data.itemName||data.name||'',rpText); renderAllPanels(); return; }
@@ -2506,6 +2722,10 @@
       if(s.专精)al.专精=s.专精; if(s.logic)al.logic=s.logic; if(s.script)al.script=s.script;
       calcDerived(al); state.units.push(al);
     });
+    /* <pos>站位覆盖 + 地形（来自召唤源楼层文本）+ 记录已处理的spawn楼层ID（防重复） */
+    if(opts.terrain)state.terrain=opts.terrain;
+    if(opts.posText)applyPositions(state,opts.posText);
+    if(opts.spawnMsgId!=null&&opts.spawnMsgId!==''){ state.spawnHandledMsgIds=[opts.spawnMsgId]; }
     addLog(state,'-- 战斗开始 · 回合1 --');
     var initReport=buildReport(state,'战斗开始！'+state.units.map(function(u){return u.name+' HP'+u.hp+'/'+u.derived.hpMax;}).join(' vs '),'','战斗开始');
     addLog(state,initReport);
@@ -2533,7 +2753,10 @@
     distance:distance, inRange:inRange, unitsInAOE:unitsInAOE, ATTRS:ATTRS, ROLL_TARGETS:ROLL_TARGETS, WEAPON_RANGE:WEAPON_RANGE,
     parseTerrain:parseTerrain, terrainAt:terrainAt, inLineOfSight:inLineOfSight, pathfind:pathfind, getTerrainAttackMods:getTerrainAttackMods, triggerTrap:triggerTrap, checkTerrainCondition:checkTerrainCondition,
     startCombatSession:startCombatSession, enterCombat:enterCombat, combatAction:HOST.combatAction,
-    renderCombatPanel:renderCombatPanel
+    renderCombatPanel:renderCombatPanel,
+    getAttackMode:getAttackMode, weaponAOERadius:weaponAOERadius,
+    parsePositions:parsePositions, applyPositions:applyPositions, buildPositionsBlock:buildPositionsBlock,
+    undoPendingAction:undoPendingAction, requeueMarks:requeueMarks
   };
 
   console.log('[多维矩阵·战斗引擎] v6.2 已加载（真同层+地形系统A6+角色管理tab+编年史支持+战斗结束摘要回归非同层）');
