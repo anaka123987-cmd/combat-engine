@@ -986,15 +986,25 @@
       logs.slice(-10).forEach(function(e){ summary+=e.text+'\n'; });
     }
     summary+='\n（战斗结束，继续剧情对话）';
-    summary='<summary>'+summary+'</summary>';
-    /* 不再写回注入楼层：发送摘要战报到新楼层 */
+    var fullMsg='<content>战斗结束</content>\n<summary>'+summary+'</summary>';
+    /* 发送摘要战报到新楼层（含 <content> 保证伪同层正常解析，避免空楼层） */
     try{
       if(typeof createChatMessages==='function'){
-        await createChatMessages([{role:'assistant',message:summary}],{refresh:'affected'});
+        await createChatMessages([{role:'assistant',message:fullMsg}],{refresh:'affected'});
       }
     }catch(e){ console.error('[战斗引擎v6] 战斗摘要发送失败',e); }
-    /* 延迟清除状态（让renderAllPanels先渲染结束态） */
-    setTimeout(function(){ clearCombatState(); renderAllPanels(); }, 1500);
+    /* 延迟清除：引擎状态 + MVU 战斗中标记 一起置 false，避免控制台/怪物残留与自动重召唤 */
+    setTimeout(function(){
+      try{ clearCombatState(); renderAllPanels(); }catch(e){}
+      try{
+        var lid=(typeof lastMsgIdSafe==='function')?lastMsgIdSafe():null;
+        if(lid!==null && typeof getVariables==='function' && typeof insertOrAssignVariables==='function'){
+          var vv=getVariables({type:'message',message_id:lid});
+          var sdd=vv && vv.stat_data;
+          if(sdd && sdd['主页']){ sdd['主页']['战斗中']=false; insertOrAssignVariables({stat_data:sdd},{type:'message',message_id:lid}); }
+        }
+      }catch(e2){ console.error('[战斗引擎v6] 清除MVU战斗标记失败',e2); }
+    }, 1500);
   }
 
   /* ======================================================================
@@ -2712,18 +2722,26 @@
     var enemyArr=[], allyArr=[];
     if(Array.isArray(spawns)){ enemyArr=spawns; }
     else if(spawns&&typeof spawns==='object'){ enemyArr=Array.isArray(spawns.enemies)?spawns.enemies:[]; allyArr=Array.isArray(spawns.allies)?spawns.allies:[]; }
-    enemyArr.forEach(function(s){
+    /* [地形可视化修复] 地形提前赋值，便于下方默认站位按战场尺寸散开并防越界 */
+    if(opts.terrain)state.terrain=opts.terrain;
+    var tw=state.terrain?state.terrain.width:12, th=state.terrain?state.terrain.height:8;
+    enemyArr.forEach(function(s,ei){
       var en=makeEnemy(s.name||'敌人', s.hp||30, s.str||12, s.agi||14, s.con||10, s.int||8, s.spi||8, s.cha||8);
       if(s.专精)en.专精=s.专精; if(s.logic)en.logic=s.logic; if(s.script)en.script=s.script;
+      /* [地形可视化修复] 敌人默认站位散开（列7-9，行2/4/6），避免全部叠在同一格 */
+      en.x=Math.min(tw-1, 7+(ei%3));
+      en.y=Math.min(th-1, 2+Math.floor(ei/3)*2);
       calcDerived(en); state.units.push(en);
     });
-    allyArr.forEach(function(s){
+    allyArr.forEach(function(s,ai){
       var al=makeAlly(s.name||'队友', s.hp||30, s.str||12, s.agi||14, s.con||10, s.int||8, s.spi||8, s.cha||8);
       if(s.专精)al.专精=s.专精; if(s.logic)al.logic=s.logic; if(s.script)al.script=s.script;
+      /* [地形可视化修复] 队友默认站位散开（列3-4，行2/4/6），围绕玩家布置 */
+      al.x=Math.max(1, Math.min(tw-1, 3+(ai%2)));
+      al.y=Math.min(th-1, 2+Math.floor(ai/2)*2);
       calcDerived(al); state.units.push(al);
     });
-    /* <pos>站位覆盖 + 地形（来自召唤源楼层文本）+ 记录已处理的spawn楼层ID（防重复） */
-    if(opts.terrain)state.terrain=opts.terrain;
+    /* <pos>站位覆盖 + 记录已处理的spawn楼层ID（防重复） */
     if(opts.posText)applyPositions(state,opts.posText);
     if(opts.spawnMsgId!=null&&opts.spawnMsgId!==''){ state.spawnHandledMsgIds=[opts.spawnMsgId]; }
     addLog(state,'-- 战斗开始 · 回合1 --');
