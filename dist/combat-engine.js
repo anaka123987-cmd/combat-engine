@@ -976,6 +976,10 @@
   /* ===== 战斗结束：将战斗消息体替换为摘要（移除<CombatHud/>，回归非同层对话） ===== */
   async function finalizeCombatMessage(state, endMsg){
     if(!state)return;
+    /* [FIX] 立即进入结束态：消灭手动结束后 ~1.5s 内 state.active 仍为 true 的残留窗口 */
+    state.active=false; state.phase='COMBAT_END';
+    try{ saveCombatState(state); }catch(e0){}
+    try{ renderAllPanels(); }catch(e0b){}
     var digests=state.digests||[];
     var summary='═══ 战斗记录 · '+endMsg+' ═══\n\n';
     if(digests.length){
@@ -987,10 +991,20 @@
     }
     summary+='\n（战斗结束，继续剧情对话）';
     var fullMsg='<content>战斗结束</content>\n<summary>'+summary+'</summary>';
+    /* [FIX] 继承最近一条带 stat_data 楼层的变量（并置 主页.战斗中=false）随摘要楼层一起写入：
+       1) MVU 变量链在新楼层不断档，状态栏 HUD 不再读到陈旧数据；
+       2) 战斗标记随楼层正确落盘，状态栏不会因读到旧的 战斗中=true 而自动重召战斗 */
+    var carrySd=null;
+    try{
+      var baseSd=(typeof fetchStatData==='function')?fetchStatData():null;
+      if(baseSd){ carrySd=JSON.parse(JSON.stringify(baseSd)); if(carrySd&&carrySd['主页'])carrySd['主页']['战斗中']=false; }
+    }catch(eSd){ carrySd=null; }
     /* 发送摘要战报到新楼层（含 <content> 保证伪同层正常解析，避免空楼层） */
     try{
       if(typeof createChatMessages==='function'){
-        await createChatMessages([{role:'assistant',message:fullMsg}],{refresh:'affected'});
+        var endMsgObj={role:'assistant',message:fullMsg};
+        if(carrySd)endMsgObj.data={stat_data:carrySd};
+        await createChatMessages([endMsgObj],{refresh:'affected'});
       }
     }catch(e){ console.error('[战斗引擎v6] 战斗摘要发送失败',e); }
     /* 延迟清除：引擎状态 + MVU 战斗中标记 一起置 false，避免控制台/怪物残留与自动重召唤 */
