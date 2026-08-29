@@ -210,7 +210,9 @@
     (unit.buffs||[]).forEach(function(b){
       if(b.effect==='attr_mod' && b.target){
         if(!ctx.attrMods[b.target])ctx.attrMods[b.target]=[];
-        ctx.attrMods[b.target].push(b.formula);
+        var bf=String(b.formula==null?'':b.formula).trim()||'0';
+        if(b.op==='-'&&bf.charAt(0)!=='-')bf='-'+bf; /* 与 getBuffMod 同规则：op='-' 取负，避免减益当增益 */
+        ctx.attrMods[b.target].push(bf);
       }
       if(b.effect==='roll_mod' && b.rollTarget===rollType){
         ctx.rollMods.push(b.formula);
@@ -244,7 +246,14 @@
 
   /* ===== 衍生属性计算 ===== */
   function getBuffMod(unit,attr){
-    var sum=0; (unit.buffs||[]).forEach(function(b){ if(b.effect==='attr_mod'&&b.target===attr) sum+=num(b.flatVal,0); });
+    var sum=0; (unit.buffs||[]).forEach(function(b){
+      if(b.effect==='attr_mod'&&b.target===attr){
+        var m=num(b.flatVal,0);
+        if(b.op==='-'){ if(m>0)m=-m; }          /* op='-' 且 flatVal 为量纲值时取负；flatVal 已带负号不重复取 */
+        else if(b.op!=='+'&&b.op!=='-'){ m=0; } /* 乘除型 attr_mod 无法线性叠加，只参与骰子公式 */
+        sum+=m;
+      }
+    });
     return sum;
   }
   function calcDerived(unit){
@@ -667,7 +676,7 @@
       card._effects.forEach(function(eff){
         if(eff.effect==='attr_mod'){
           if(!unit.buffs)unit.buffs=[];
-          unit.buffs.push({name:'装备:'+itemName,effect:'attr_mod',target:eff.target,op:eff.op||'+',formula:eff.formula,flatVal:0,turns:-1,source:itemName,sourceType:'equipment'});
+          unit.buffs.push({name:'装备:'+itemName,effect:'attr_mod',target:eff.target,op:eff.op||'+',formula:eff.formula,flatVal:num(eff.formula,0),turns:-1,source:itemName,sourceType:'equipment'});
         }
         if(eff.effect==='roll_mod'){
           if(!unit.buffs)unit.buffs=[];
@@ -999,6 +1008,20 @@
       var baseSd=(typeof fetchStatData==='function')?fetchStatData():null;
       if(baseSd){ carrySd=JSON.parse(JSON.stringify(baseSd)); if(carrySd&&carrySd['主页'])carrySd['主页']['战斗中']=false; }
     }catch(eSd){ carrySd=null; }
+    /* [FIX] 战斗消耗回写：玩家战斗后的 HP(耐力)/能量 同步进随摘要楼层写入的 stat_data，
+       状态栏档案页/商城读到的不再是一战前的旧值 */
+    try{
+      var pu=state.units.find(function(u){return u.isPlayer;});
+      if(pu&&carrySd){
+        var da=carrySd['个人档案']||(carrySd['个人档案']={});
+        var dsy=da['衍生属性']||(da['衍生属性']={});
+        var hpO=dsy['生命值']||(dsy['生命值']={});
+        hpO['当前']=Math.max(0,Math.round(num(pu.hp,0)));
+        var hpMaxV=num(pu.hpMaxBase,0); if(hpMaxV>0)hpO['最大']=Math.round(hpMaxV);
+        var enO=dsy['能量值']||(dsy['能量值']={});
+        enO['当前']=Math.max(0,Math.round(num(pu.energy,0)));
+      }
+    }catch(eWb){ console.error('[战斗引擎v6] 战斗消耗回写失败',eWb); }
     /* 发送摘要战报到新楼层（含 <content> 保证伪同层正常解析，避免空楼层） */
     try{
       if(typeof createChatMessages==='function'){
@@ -1598,13 +1621,13 @@
             p.hp=clamp(p.hp+heal.total,0,p.derived.hpMax);
             actionStr+='恢复HP '+heal.detail+'='+heal.total+' → HP '+p.hp+'\n';
           } else {
-            p.buffs.push({name:eff.name,effect:'attr_mod',target:eff.target||'',op:eff.op||'+',formula:eff.formula,flatVal:0,turns:eff.duration||3});
+            p.buffs.push({name:eff.name,effect:'attr_mod',target:eff.target||'',op:eff.op||'+',formula:eff.formula,flatVal:num(eff.formula,0),turns:eff.duration||3});
             actionStr+='获得'+eff.name+'('+eff.duration+'回合)\n';
           }
         }
         if(eff.effect==='attr_mod'){
           if(!p.buffs)p.buffs=[];
-          p.buffs.push({name:skillName+':'+eff.target,effect:'attr_mod',target:eff.target,op:eff.op||'+',formula:eff.formula,flatVal:0,turns:eff.duration||3});
+          p.buffs.push({name:skillName+':'+eff.target,effect:'attr_mod',target:eff.target,op:eff.op||'+',formula:eff.formula,flatVal:num(eff.formula,0),turns:eff.duration||3});
           actionStr+='获得'+eff.target+eff.op+eff.formula+'('+(eff.duration||3)+'回合)\n';
         }
         if(eff.effect==='roll_mod'){
