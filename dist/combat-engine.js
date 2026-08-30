@@ -266,9 +266,11 @@
     d.physDef=Math.floor(eff['体质']/2)+num(unit.equipBonus&&unit.equipBonus.physDef,0);
     d.mystDef=Math.floor(eff['精神']/2)+num(unit.equipBonus&&unit.equipBonus.mystDef,0);
     d.critRate=5+num(unit.equipBonus&&unit.equipBonus.crit,0);
-    d.energyMax=Math.floor((num(eff['精神'],10)+num(unit.equipBonus&&unit.equipBonus.energy,0)));
+    d.energyMax=Math.floor(num(eff['精神'],10)*2+num(unit.equipBonus&&unit.equipBonus.energy,0));
     if(d.energyMax<1)d.energyMax=1;
-    d.hpMax=num(unit.hpMaxBase,d.energyMax); if(d.hpMax<1)d.hpMax=1;
+    /* 生命公式（作者定义）：100+(体质-10)×10；MVU 的 生命值.最大 优先（AI/创建时写入），缺失或非法时按公式兜底 */
+    d.hpMax=num(unit.hpMaxBase,0);
+    if(d.hpMax<1)d.hpMax=Math.max(1,100+(num(eff['体质'],10)-10)*10);
     if(unit.hp==null||unit.hp<0)unit.hp=d.hpMax;
     if(unit.hp>d.hpMax)unit.hp=d.hpMax;
     if(unit.energy==null||unit.energy<0)unit.energy=d.energyMax;
